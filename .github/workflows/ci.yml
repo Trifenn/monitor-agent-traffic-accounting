@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   check:
+    if: github.repository == 'monitor-probe/agent'
     runs-on: ubuntu-latest
     # A hanging test would otherwise consume the six-hour default; the suite
     # runs in well under a second.

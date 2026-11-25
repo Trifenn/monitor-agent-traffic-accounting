@@ -1,0 +1,6 @@
+{
+  "state_file": "/var/lib/monitor-agent/traffic/state.json",
+  "report": "raw",
+  "strict": true,
+  "checkpoint_secs": 30
+}

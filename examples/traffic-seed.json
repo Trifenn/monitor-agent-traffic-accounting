@@ -1,0 +1,6 @@
+{
+  "boot_id": "REPLACE-WITH-LAST-REPORTED-BOOT-ID/INTERFACE-DIGEST",
+  "net_rx_total": 0,
+  "net_tx_total": 0,
+  "note": "Replace with the last report's counters and record their source. Use zero counters for a new node."
+}

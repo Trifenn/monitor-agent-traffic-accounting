@@ -14,6 +14,7 @@ on:
 
 jobs:
   audit:
+    if: github.repository == 'monitor-probe/agent'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -27,7 +28,8 @@ jobs:
   # Advisories on crates that are in Cargo.lock but not compiled in, such as an
   # optional feature left off, are listed without failing.
   released:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      ${{ github.repository == 'monitor-probe/agent' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

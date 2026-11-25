@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod traffic;
 
 use std::time::Duration;
 
@@ -23,11 +24,20 @@ use collect::{Collector, Facts};
 struct Args {
     server: String,
     token: String,
+    traffic_config: Option<traffic::Config>,
+    command: Command,
     interval: u64,
     ifaces: collect::Ifaces,
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
+}
+
+enum Command {
+    Run,
+    Check,
+    Status,
+    Init(String),
 }
 
 fn usage() -> ! {
@@ -41,6 +51,10 @@ fn usage() -> ! {
            --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
                                 eth1,pppoe-wan. `-name` removes an interface\n                       \
                                 from what would be counted. Full names only.\n  \
+           --traffic-config <file>  Local traffic JSON (MONITOR_TRAFFIC_CONFIG)\n  \
+           --traffic-check      Offline interface/config check (JSON)\n  \
+           --traffic-status     Offline durable state audit (JSON)\n  \
+           --traffic-init <seed.json>  Initialize a new ledger explicitly\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",
@@ -51,6 +65,8 @@ fn usage() -> ! {
 
 fn parse_args() -> Result<Args> {
     let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let mut config_path = None;
+    let mut command = Command::Run;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -59,16 +75,39 @@ fn parse_args() -> Result<Args> {
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--iface" => iface = Some(value()),
+            "--traffic-config" => config_path = Some(value()),
+            "--traffic-check" | "--traffic-status" | "--traffic-init" => {
+                ensure_single_command(&command)?;
+                command = match arg.as_str() {
+                    "--traffic-check" => Command::Check,
+                    "--traffic-status" => Command::Status,
+                    _ => Command::Init(value()),
+                };
+            }
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
     }
-    let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
-    let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
+    let (server, token) = if matches!(command, Command::Run) {
+        let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
+        let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
+        (server, token)
+    } else {
+        (String::new(), String::new())
+    };
     let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
+    let config_path = config_path.or_else(|| std::env::var("MONITOR_TRAFFIC_CONFIG").ok());
+    let traffic_config = config_path.map(|p| traffic::Config::load(&p, &ifaces)).transpose()?;
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure, traffic_config, command })
+}
+
+fn ensure_single_command(command: &Command) -> Result<()> {
+    if !matches!(command, Command::Run) {
+        bail!("choose only one offline traffic command");
+    }
+    Ok(())
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -198,7 +237,23 @@ fn remaining(last_frame: Instant) -> Duration {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = parse_args()?;
+    match &args.command {
+        Command::Check => return traffic::check(&args.ifaces, args.traffic_config.as_ref()),
+        Command::Status => {
+            return traffic::status(
+                args.traffic_config.as_ref().context("--traffic-status requires --traffic-config")?,
+            )
+        }
+        Command::Init(seed) => {
+            return traffic::initialize(
+                args.traffic_config.as_ref().context("--traffic-init requires --traffic-config")?,
+                seed,
+            )
+        }
+        Command::Run => {}
+    }
     let url = ws_url(&args.server, args.insecure)?;
+    let ledger = args.traffic_config.map(traffic::Ledger::open).transpose()?;
     // Reported once at startup. install.sh hardens this unit with
     // ProtectHome=yes and a user of its own, which keep some disks out of the
     // totals. The unit file owns that decision, but the discrepancy must not go
@@ -220,7 +275,11 @@ async fn main() -> Result<()> {
     for (mount, e) in collect::unreadable_mounts(&mounts) {
         eprintln!("{mount} cannot be read ({e}) and is not counted toward disk totals");
     }
+    let traffic = ledger.map(|ledger| ledger.start(args.ifaces.clone(), Duration::from_secs(args.interval)));
     let mut collector = Collector::new(args.ifaces);
+    if let Some(traffic) = traffic {
+        collector = collector.with_traffic(traffic);
+    }
     // Reported once at startup: an interface summed twice otherwise shows only
     // as a total twice the real one. One listed in --iface but absent here,
     // such as a PPPoE link not yet dialled, is counted once it appears.
@@ -365,10 +424,9 @@ async fn session(
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     // The baseline is taken a second before the first report, which then
-    // measures CPU and network over that second rather than over nothing --
-    // all a freshly started process has -- or over the outage since the
-    // previous session.
-    collector.collect();
+    // measures CPU and native network rates over that second. With a ledger,
+    // network sampling runs independently of this connection.
+    collector.report();
     let mut ticker =
         tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -378,7 +436,8 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let m = serde_json::to_value(collector.collect())?;
+                let Some(metrics) = collector.report() else { continue };
+                let m = serde_json::to_value(metrics)?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
             }
             _ = recheck.tick() => {
@@ -781,6 +840,95 @@ mod tests {
         assert_eq!(ws_url("wss://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
         assert_eq!(ws_url("HTTPS://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
         assert!(ws_url("HTTP://hub.example.com", false).is_err(), "plaintext whatever its case");
+    }
+
+    /// Exercise hello/report over the native WebSocket protocol. The extended
+    /// report keeps the original keys and the seeded epoch/counters; raw rates
+    /// remain independent of a zero billing policy.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn traffic_report_uses_native_wire_schema_and_migration_epoch() {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!(
+            "monitor-wire-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let seed = dir.join("seed.json");
+        std::fs::write(&seed, r#"{"boot_id":"migration-kernel/set","net_rx_total":1234567,"net_tx_total":2345678,"note":"synthetic migration"}"#).unwrap();
+        let config = traffic::Config {
+            state_file: dir.join("state.json"),
+            report: traffic::Report::Billing,
+            strict: true,
+            checkpoint_secs: 5,
+            weights: [(
+                "lo".into(),
+                traffic::Weights { rx_to_in_ppm: 0, rx_to_out_ppm: 0, tx_to_in_ppm: 0, tx_to_out_ppm: 0 },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        traffic::initialize(&config, seed.to_str().unwrap()).unwrap();
+        let ledger = traffic::Ledger::open(config).unwrap();
+        let ifaces = collect::Ifaces::parse("lo").unwrap();
+        let traffic = ledger.start(ifaces.clone(), Duration::from_secs(1));
+        let mut collector = Collector::new(ifaces).with_traffic(traffic);
+        let native_keys = serde_json::to_value(Collector::default().report().unwrap())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/agent/ws", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut hello = false;
+            while let Some(message) = ws.next().await {
+                let message = message.unwrap();
+                if let Message::Text(text) = message {
+                    let rpc: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(rpc["jsonrpc"], "2.0");
+                    if rpc["method"] == "hello" {
+                        hello = true;
+                        assert_eq!(rpc["params"]["agent_version"], env!("CARGO_PKG_VERSION"));
+                        ws.send(Message::Ping(vec![0; 64].into())).await.unwrap();
+                    }
+                    if rpc["method"] == "report" {
+                        assert!(hello);
+                        let metrics = &rpc["params"];
+                        assert_eq!(
+                            metrics.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+                            native_keys
+                        );
+                        assert_eq!(metrics["boot_id"], "migration-kernel/set");
+                        assert_eq!(metrics["net_rx_total"], 1234567);
+                        assert_eq!(metrics["net_tx_total"], 2345678);
+                        assert_eq!(metrics["iface"], "lo");
+                        if metrics["net_rx"].as_u64().unwrap() == 0 {
+                            ws.send(Message::Ping(vec![0; 64].into())).await.unwrap();
+                            continue;
+                        }
+                        ws.close(None).await.unwrap();
+                        return;
+                    }
+                }
+            }
+            panic!("session ended before a valid traffic report");
+        });
+        let mut connected = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (_, server) =
+                tokio::join!(session(&url, "synthetic", &mut collector, 1, &mut connected), server);
+            server.unwrap();
+        })
+        .await
+        .unwrap();
+        drop(collector);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// `--insecure` covers a hub reached at ip:port with no TLS: it permits the

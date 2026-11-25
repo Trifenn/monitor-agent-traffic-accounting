@@ -1,0 +1,12 @@
+{
+  "state_file": "/var/lib/monitor-agent/traffic/state.json",
+  "report": "billing",
+  "weights": {
+    "relay0": {
+      "rx_to_in_ppm": 0,
+      "rx_to_out_ppm": 1000000,
+      "tx_to_in_ppm": 0,
+      "tx_to_out_ppm": 2000000
+    }
+  }
+}

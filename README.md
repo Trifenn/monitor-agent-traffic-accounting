@@ -8,7 +8,7 @@
 
 - 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo
 - 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
-- 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
+- 默认无状态，流量累加由 hub 负责。可选的[流量计量](TRAFFIC.md)支持逐网卡倍率和持久累计
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
 
@@ -35,6 +35,7 @@ monitor-agent --server https://your-hub --token <token>
 | `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
 | `--iface` | 空 | 流量统计的网卡，逗号分隔，也可用 `MONITOR_IFACE`；见下 |
+| `--traffic-config` | 未启用 | 本地流量配置文件，也可用 `MONITOR_TRAFFIC_CONFIG`。见[配置和离线诊断](TRAFFIC.md) |
 
 ### 统计哪些网卡的流量
 
@@ -52,7 +53,7 @@ monitor-agent --server https://your-hub --token <token>
   一批机器都有一块同名的内网网卡时，一条批量命令就能在每台上去掉它
 - 只认完整的网卡名，不支持通配
 
-启动时打印一行 `counting traffic on: ...`，列出此刻计入的网卡。所计网卡的集合一旦变化（改了 `--iface`、
+启动时打印一行 `counting traffic on: ...`，列出此刻计入的网卡。默认采集下，所计网卡的集合一旦变化（改了 `--iface`、
 网卡增减或被重新归类），上报的 `boot_id` 也跟着变，hub 重新对基线，不会把新旧两组读数之差记成流量。
 
 ## 上报字段
@@ -62,9 +63,10 @@ monitor-agent --server https://your-hub --token <token>
 - **`Facts`** 连接时上报一次：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存与磁盘总量、本机 IPv4 / IPv6（每族一个，公网地址优先；IPv6 不取临时地址和已废弃地址）
 - **`Metrics`** 每 `--interval` 秒上报：CPU、负载、内存、swap、磁盘、网卡收发速率与内核累计计数器、TCP / UDP 连接数、进程数、运行时间
 
-`net_rx_total` / `net_tx_total` 为所计网卡的内核 lifetime 计数器之和，原样上报；`boot_id` 取自
+默认采集下，`net_rx_total` / `net_tx_total` 为所计网卡的内核 lifetime 计数器之和，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，后接 `/` 与所计网卡集合的摘要，标明这两个读数在哪段区间内可以相减，
 是 hub 判定计数器重新开始的唯一依据，**不要删**。`iface` 回报当前的 `--iface`，供面板显示与预填。
+启用流量计量后，同一对累计字段可上报持久原始增量或持久加权增量，实时速率仍为原始字节每秒。
 
 连接 hub 时逐个尝试解析出的地址，除最后一个外每个限 5 秒。网卡上只有内网 IPv4（NAT）时先连 hub 的
 IPv4：NAT 的公网地址不在网卡上，hub 只有看到一条 IPv4 连接才知道它。

@@ -117,12 +117,10 @@ pub struct Facts {
 #[derive(Serialize)]
 pub struct Metrics {
     /// Names the span over which `net_rx_total` and `net_tx_total` readings
-    /// are comparable. The hub only tests it for equality, and a change makes
-    /// it re-baseline rather than book the difference. It is the kernel's boot
-    /// id, which changes when the counters restart at zero, then `/` and a
-    /// digest of the interfaces summed: an interface joining the sum within one
-    /// boot -- a reclassified device, a changed `--iface` -- would otherwise
-    /// have its lifetime bytes booked as traffic.
+    /// are comparable. The hub uses a change to re-baseline. Native collection
+    /// uses the kernel's boot ID and the digest of the interfaces summed, so a
+    /// newly counted interface cannot contribute its lifetime bytes. A ledger
+    /// reports its seed epoch for as long as its totals are comparable.
     pub boot_id: String,
     /// The `--iface` this agent runs with, empty for the default rules. Shown
     /// by the panel, which reinstalls with it.
@@ -136,9 +134,8 @@ pub struct Metrics {
     pub swap_used: u64,
     pub disk_total: u64,
     pub disk_used: u64,
-    /// The counted interfaces' lifetime byte counters, summed. The hub
-    /// accumulates these; the agent stores nothing and does not attempt to
-    /// survive a reboot.
+    /// Native lifetime counters or the ledger's checkpointed totals. The hub
+    /// accumulates their differences for its reporting periods.
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     pub net_rx: u64,
@@ -159,7 +156,7 @@ pub struct Metrics {
 /// starting with `-` removes that interface from what is counted otherwise,
 /// which one batch command can apply across machines whose other NICs are named
 /// differently. Exclusions win over inclusions.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Ifaces {
     spec: String,
     only: Vec<String>,
@@ -188,7 +185,23 @@ impl Ifaces {
         Ok(ifaces)
     }
 
-    fn counts(&self, sys: &Path, name: &str) -> bool {
+    pub fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    pub fn validate_names(&self) -> anyhow::Result<()> {
+        for name in self.only.iter().chain(&self.skip) {
+            crate::traffic::validate_name(name)?;
+        }
+        Ok(())
+    }
+
+    pub fn missing<'a>(&self, names: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let names: Vec<_> = names.collect();
+        self.only.iter().filter(|n| !self.skip.contains(n) && !names.contains(&n.as_str())).cloned().collect()
+    }
+
+    pub fn counts(&self, sys: &Path, name: &str) -> bool {
         if self.skip.iter().any(|n| n == name) {
             return false;
         }
@@ -210,7 +223,7 @@ impl Ifaces {
 /// Per-interface counters in the report, summed by the hub, would remove the
 /// loss; an offset kept here would not, as it dies with the process and takes the
 /// traffic of the downtime with it.
-fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
+pub fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
     let mut names: Vec<&str> = names.collect();
     names.sort_unstable();
     // A newline cannot occur in an interface name, so no two sets join alike.
@@ -223,6 +236,7 @@ fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
 
 #[derive(Default)]
 pub struct Collector {
+    traffic: Option<tokio::sync::watch::Receiver<Option<crate::traffic::Reading>>>,
     ifaces: Ifaces,
     prev_cpu: Option<(u64, u64)>,
     /// When the last sample was taken, and each counted interface's counters.
@@ -230,9 +244,41 @@ pub struct Collector {
     prev_net: HashMap<String, (u64, u64)>,
 }
 
+struct Network {
+    boot_id: String,
+    rx_total: u64,
+    tx_total: u64,
+    rx: u64,
+    tx: u64,
+}
+
 impl Collector {
     pub fn new(ifaces: Ifaces) -> Self {
         Self { ifaces, ..Self::default() }
+    }
+
+    pub fn with_traffic(
+        mut self,
+        traffic: tokio::sync::watch::Receiver<Option<crate::traffic::Reading>>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
+    }
+
+    pub fn report(&mut self) -> Option<Metrics> {
+        let Some(traffic) = &self.traffic else { return Some(self.collect()) };
+        let net = {
+            let reading = traffic.borrow();
+            let reading = reading.as_ref()?;
+            Network {
+                boot_id: reading.epoch.clone(),
+                rx_total: reading.total.rx,
+                tx_total: reading.total.tx,
+                rx: reading.rate.rx,
+                tx: reading.rate.tx,
+            }
+        };
+        Some(self.collect_metrics(Some(net)))
     }
 
     /// The interfaces the traffic totals include at this moment.
@@ -277,11 +323,11 @@ impl Collector {
         }
     }
 
-    pub fn collect(&mut self) -> Metrics {
-        let mem = meminfo();
-        let (mem_total, mem_used) = mem_used(&mem);
-        let (swap_total, swap_used) = swap_used(&mem);
-        let (disk_total, disk_used) = disk_usage(&real_mount_points());
+    fn collect(&mut self) -> Metrics {
+        self.collect_metrics(None)
+    }
+
+    fn native_network(&mut self) -> Network {
         let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
         let counted = self.counted(&dev);
         let (rx_total, tx_total) = totals(&counted);
@@ -290,10 +336,19 @@ impl Collector {
             counted.iter().map(|(name, ..)| *name),
         );
         let (rx, tx) = self.net_rate(&counted, Instant::now());
+        Network { boot_id, rx_total, tx_total, rx, tx }
+    }
+
+    fn collect_metrics(&mut self, net: Option<Network>) -> Metrics {
+        let mem = meminfo();
+        let (mem_total, mem_used) = mem_used(&mem);
+        let (swap_total, swap_used) = swap_used(&mem);
+        let (disk_total, disk_used) = disk_usage(&real_mount_points());
+        let net = net.unwrap_or_else(|| self.native_network());
         let (tcp, udp) = conn_counts();
 
         Metrics {
-            boot_id,
+            boot_id: net.boot_id,
             iface: self.ifaces.spec.clone(),
             uptime: uptime(),
             cpu: self.cpu_percent(),
@@ -304,10 +359,10 @@ impl Collector {
             swap_used,
             disk_total,
             disk_used,
-            net_rx_total: rx_total,
-            net_tx_total: tx_total,
-            net_rx: rx,
-            net_tx: tx,
+            net_rx_total: net.rx_total,
+            net_tx_total: net.tx_total,
+            net_rx: net.rx,
+            net_tx: net.tx,
             tcp,
             udp,
             procs: proc_count(),
@@ -1108,12 +1163,16 @@ fn hypervisor() -> Option<&'static str> {
 /// would name one hypervisor several ways. A hypervisor that clears the bit
 /// leaves its guest reported as bare metal.
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)] // Newer compilers expose __cpuid as a safe intrinsic.
 fn platform_hypervisor() -> Option<&'static str> {
     use std::arch::x86_64::__cpuid;
-    if __cpuid(1).ecx >> 31 == 0 {
+    // SAFETY: CPUID is available on every x86_64 CPU. Rust 1.90 exposes
+    // this instruction through an unsafe intrinsic; neither leaf dereferences memory.
+    if unsafe { __cpuid(1) }.ecx >> 31 == 0 {
         return None;
     }
-    let leaf = __cpuid(0x4000_0000);
+    // SAFETY: as above; an unsupported leaf still returns register values.
+    let leaf = unsafe { __cpuid(0x4000_0000) };
     let mut signature = [0; 12];
     for (bytes, reg) in signature.chunks_mut(4).zip([leaf.ebx, leaf.ecx, leaf.edx]) {
         bytes.copy_from_slice(&reg.to_le_bytes());
